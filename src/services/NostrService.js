@@ -1,4 +1,4 @@
-import { SimplePool, getEventHash, getSignature, generatePrivateKey, getPublicKey } from 'nostr-tools'
+import { SimplePool, getEventHash, getSignature, generatePrivateKey, getPublicKey, nip19 } from 'nostr-tools'
 
 class NostrService {
   constructor() {
@@ -13,16 +13,107 @@ class NostrService {
     this.publicKey = null
     this.connected = false
     this.subscriptions = new Map()
+    this.userProfile = null
+    this.familyLocations = new Map()
+    this.familyPhotos = []
+  }
+
+  // Generate new Nostr keypair
+  generateKeys() {
+    const privateKey = generatePrivateKey()
+    const publicKey = getPublicKey(privateKey)
+    const npub = nip19.npubEncode(publicKey)
+    const nsec = nip19.nsecEncode(privateKey)
+    
+    return { privateKey, publicKey, npub, nsec }
+  }
+
+  // Import existing keys from nsec
+  importKeys(nsec) {
+    try {
+      const { type, data } = nip19.decode(nsec)
+      if (type !== 'nsec') {
+        throw new Error('Invalid nsec format')
+      }
+      
+      const privateKey = data
+      const publicKey = getPublicKey(privateKey)
+      const npub = nip19.npubEncode(publicKey)
+      
+      return { privateKey, publicKey, npub, nsec }
+    } catch (error) {
+      throw new Error('Invalid nsec key: ' + error.message)
+    }
+  }
+
+  // Set user keys and save to localStorage
+  setUserKeys(keys, profile = {}) {
+    this.privateKey = keys.privateKey
+    this.publicKey = keys.publicKey
+    this.userProfile = {
+      npub: keys.npub,
+      nsec: keys.nsec,
+      name: profile.name || 'Anonymous',
+      ...profile
+    }
+
+    // Save to localStorage
+    localStorage.setItem('nostravel_keys', JSON.stringify({
+      nsec: keys.nsec,
+      profile: this.userProfile
+    }))
+  }
+
+  // Load existing keys from localStorage
+  loadStoredKeys() {
+    try {
+      const stored = localStorage.getItem('nostravel_keys')
+      if (stored) {
+        const { nsec, profile } = JSON.parse(stored)
+        const keys = this.importKeys(nsec)
+        this.setUserKeys(keys, profile)
+        return true
+      }
+    } catch (error) {
+      console.error('Failed to load stored keys:', error)
+      localStorage.removeItem('nostravel_keys')
+    }
+    return false
+  }
+
+  // Clear stored keys (logout)
+  clearKeys() {
+    this.privateKey = null
+    this.publicKey = null
+    this.userProfile = null
+    this.familyLocations.clear()
+    this.familyPhotos = []
+    localStorage.removeItem('nostravel_keys')
+  }
+
+  // Check if user is authenticated
+  isAuthenticated() {
+    return !!(this.privateKey && this.publicKey && this.userProfile)
+  }
+
+  // Get user info
+  getUserInfo() {
+    return this.userProfile
+  }
+
+  // Get short display name from npub
+  getDisplayName(npub) {
+    if (!npub) return 'Unknown'
+    return npub.slice(0, 12) + '...'
   }
 
   async connect() {
     try {
-      // Generate or retrieve private key (in a real app, this should be stored securely)
-      this.privateKey = localStorage.getItem('nostr-private-key') || generatePrivateKey()
-      localStorage.setItem('nostr-private-key', this.privateKey)
-      
-      this.publicKey = getPublicKey(this.privateKey)
-      
+      // Try to load existing keys first
+      if (!this.isAuthenticated()) {
+        this.loadStoredKeys()
+      }
+
       // Connect to relays
       await Promise.all(
         this.relays.map(relay => 
@@ -81,13 +172,19 @@ class NostrService {
     }
   }
 
-  async shareLocation(location, userName) {
+  async shareLocation(location) {
+    if (!this.isAuthenticated()) {
+      console.warn('User not authenticated')
+      return false
+    }
+
     const content = JSON.stringify({
       type: 'location',
       lat: location.lat,
       lng: location.lng,
-      timestamp: location.timestamp,
-      name: userName,
+      timestamp: location.timestamp || Date.now(),
+      name: this.userProfile.name,
+      npub: this.userProfile.npub,
       app: 'nostravel-fugen'
     })
 
@@ -98,17 +195,37 @@ class NostrService {
       ['geohash', this.encodeGeohash(location.lat, location.lng, 8)]
     ])
 
-    return await this.publishEvent(event)
+    const success = await this.publishEvent(event)
+    
+    if (success) {
+      // Update local state
+      this.familyLocations.set(this.publicKey, {
+        name: this.userProfile.name,
+        lat: location.lat,
+        lng: location.lng,
+        timestamp: Date.now(),
+        pubkey: this.publicKey,
+        npub: this.userProfile.npub
+      })
+    }
+    
+    return success
   }
 
   async sharePhoto(photo) {
+    if (!this.isAuthenticated()) {
+      console.warn('User not authenticated')
+      return false
+    }
+
     const content = JSON.stringify({
       type: 'photo',
       url: photo.url,
       caption: photo.caption,
       location: photo.location,
-      timestamp: photo.timestamp,
-      author: photo.author,
+      timestamp: photo.timestamp || Date.now(),
+      author: this.userProfile.name,
+      npub: this.userProfile.npub,
       app: 'nostravel-fugen'
     })
 
@@ -123,27 +240,53 @@ class NostrService {
     }
 
     const event = this.createEvent(1, content, tags)
-    return await this.publishEvent(event)
+    const success = await this.publishEvent(event)
+    
+    if (success) {
+      // Update local state
+      const newPhoto = {
+        id: event.id,
+        url: photo.url,
+        caption: photo.caption,
+        location: photo.location,
+        timestamp: Date.now(),
+        author: this.userProfile.name,
+        pubkey: this.publicKey,
+        npub: this.userProfile.npub
+      }
+      this.familyPhotos.unshift(newPhoto)
+    }
+    
+    return success
   }
 
   subscribeToLocations(callback) {
     if (!this.connected) {
-      // Simulate some demo data when not connected
+      // Return current local locations and simulate some demo data when not connected
       setTimeout(() => {
-        callback([
+        const demoLocations = [
           {
-            name: 'Mom',
+            name: 'Demo User 1',
             lat: 47.3450,
             lng: 11.8490,
-            timestamp: Date.now() - 300000 // 5 minutes ago
+            timestamp: Date.now() - 300000, // 5 minutes ago
+            npub: 'npub1demo1...'
           },
           {
-            name: 'Dad',
+            name: 'Demo User 2',
             lat: 47.3440,
             lng: 11.8480,
-            timestamp: Date.now() - 600000 // 10 minutes ago
+            timestamp: Date.now() - 600000, // 10 minutes ago
+            npub: 'npub1demo2...'
           }
-        ])
+        ]
+        
+        // Add current user location if authenticated
+        if (this.isAuthenticated() && this.familyLocations.has(this.publicKey)) {
+          demoLocations.push(this.familyLocations.get(this.publicKey))
+        }
+        
+        callback(demoLocations)
       }, 2000)
       return
     }
@@ -155,14 +298,20 @@ class NostrService {
     }
 
     const sub = this.pool.sub(this.relays, [filter])
-    const locations = new Map()
 
     sub.on('event', (event) => {
       try {
         const data = JSON.parse(event.content)
         if (data.type === 'location' && data.app === 'nostravel-fugen') {
-          locations.set(event.pubkey, data)
-          callback(Array.from(locations.values()).filter(loc => loc.name))
+          this.familyLocations.set(event.pubkey, {
+            name: data.name,
+            lat: data.lat,
+            lng: data.lng,
+            timestamp: data.timestamp,
+            pubkey: event.pubkey,
+            npub: data.npub || nip19.npubEncode(event.pubkey)
+          })
+          callback(Array.from(this.familyLocations.values()))
         }
       } catch (error) {
         console.error('Error parsing location event:', error)
@@ -170,22 +319,30 @@ class NostrService {
     })
 
     this.subscriptions.set('locations', sub)
+    
+    // Return current locations immediately
+    callback(Array.from(this.familyLocations.values()))
   }
 
   subscribeToPhotos(callback) {
     if (!this.connected) {
-      // Simulate some demo data when not connected
+      // Return current local photos and simulate some demo data when not connected
       setTimeout(() => {
-        callback([
+        const demoPhotos = [
           {
-            id: 1,
+            id: 'demo1',
             url: 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMzAwIiBoZWlnaHQ9IjIwMCIgZmlsbD0iIzY2N2VlYSIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMjQiIGZpbGw9IndoaXRlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkeT0iLjNlbSI+🎿 Demo Photo</3RleHQ+PC9zdmc+',
             caption: 'Amazing powder day!',
             location: { lat: 47.3447, lng: 11.8486 },
             timestamp: Date.now() - 1800000, // 30 minutes ago
-            author: 'Demo User'
+            author: 'Demo User',
+            npub: 'npub1demo...'
           }
-        ])
+        ]
+        
+        // Add current user photos
+        const allPhotos = [...this.familyPhotos, ...demoPhotos]
+        callback(allPhotos.sort((a, b) => b.timestamp - a.timestamp))
       }, 3000)
       return
     }
@@ -197,17 +354,29 @@ class NostrService {
     }
 
     const sub = this.pool.sub(this.relays, [filter])
-    const photos = []
 
     sub.on('event', (event) => {
       try {
         const data = JSON.parse(event.content)
         if (data.type === 'photo' && data.app === 'nostravel-fugen') {
-          photos.push({
+          const photo = {
             id: event.id,
-            ...data
-          })
-          callback([...photos].sort((a, b) => b.timestamp - a.timestamp))
+            url: data.url,
+            caption: data.caption,
+            location: data.location,
+            timestamp: data.timestamp,
+            author: data.author,
+            pubkey: event.pubkey,
+            npub: data.npub || nip19.npubEncode(event.pubkey)
+          }
+          
+          // Avoid duplicates
+          if (!this.familyPhotos.find(p => p.id === photo.id)) {
+            this.familyPhotos.unshift(photo)
+            this.familyPhotos.sort((a, b) => b.timestamp - a.timestamp)
+          }
+          
+          callback([...this.familyPhotos])
         }
       } catch (error) {
         console.error('Error parsing photo event:', error)
@@ -215,6 +384,9 @@ class NostrService {
     })
 
     this.subscriptions.set('photos', sub)
+    
+    // Return current photos immediately
+    callback([...this.familyPhotos])
   }
 
   // Simple geohash encoding for location indexing
