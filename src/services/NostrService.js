@@ -1,4 +1,4 @@
-import { SimplePool, getEventHash, getSignature, generatePrivateKey, getPublicKey, nip19 } from 'nostr-tools'
+import { SimplePool, getEventHash, finalizeEvent, generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
 
 class NostrService {
   constructor() {
@@ -20,7 +20,7 @@ class NostrService {
 
   // Generate new Nostr keypair
   generateKeys() {
-    const privateKey = generatePrivateKey()
+    const privateKey = generateSecretKey()
     const publicKey = getPublicKey(privateKey)
     const npub = nip19.npubEncode(publicKey)
     const nsec = nip19.nsecEncode(privateKey)
@@ -141,7 +141,7 @@ class NostrService {
   }
 
   createEvent(kind, content, tags = []) {
-    const event = {
+    const eventTemplate = {
       kind,
       created_at: Math.floor(Date.now() / 1000),
       tags,
@@ -149,10 +149,7 @@ class NostrService {
       pubkey: this.publicKey,
     }
     
-    event.id = getEventHash(event)
-    event.sig = getSignature(event, this.privateKey)
-    
-    return event
+    return finalizeEvent(eventTemplate, this.privateKey)
   }
 
   async publishEvent(event) {
